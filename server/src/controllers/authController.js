@@ -4,6 +4,16 @@ const jwt = require('jsonwebtoken');
 const login = async (req, res) => {
     try {
         const { email, password, token: idToken } = req.body;
+
+        // FAIL FAST: Check if Firebase is initialized
+        if (!auth || !db) {
+            console.error('[AUTH-FATAL] Firebase Auth or Firestore is not initialized. Check Env Vars!');
+            return res.status(500).json({
+                error: 'Authentication service unavailable',
+                details: 'Firebase services not initialized on server. Check Vercel Environment Variables.'
+            });
+        }
+
         console.log(`[AUTH] Firebase Login attempt for: ${email}`);
 
         let user;
@@ -11,9 +21,17 @@ const login = async (req, res) => {
 
         if (idToken) {
             // Verify Client-side Firebase ID Token
-            const decodedToken = await auth.verifyIdToken(idToken);
+            const decodedToken = await auth.verifyIdToken(idToken).catch(e => {
+                console.error('[AUTH] Token verification failed:', e.message);
+                throw e;
+            });
+
             const userDoc = await db.collection('users').doc(decodedToken.uid).get();
-            user = { id: decodedToken.uid, ...userDoc.data() };
+            if (userDoc.exists) {
+                user = { id: decodedToken.uid, ...userDoc.data() };
+            } else {
+                console.warn(`[AUTH] User ${decodedToken.uid} has no profile in Firestore.`);
+            }
         } else {
             // Fallback: This usually happens on the client, but for API tests:
             // In a real Firebase app, the client signs in and sends the ID Token.

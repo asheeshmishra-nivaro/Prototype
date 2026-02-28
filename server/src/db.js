@@ -1,4 +1,4 @@
-const { db: firestore } = require('./lib/firebase');
+const { db: firestore, auth } = require('./lib/firebase');
 const sqlite3 = require('sqlite3').verbose();
 const { Pool } = require('pg');
 const path = require('path');
@@ -58,6 +58,7 @@ const queryBridge = async (text, params = []) => {
 module.exports = {
     query: queryBridge,
     firestore,
+    auth,
     pool: {
         query: queryBridge,
         end: () => pgPool ? pgPool.end() : (sqlDb ? sqlDb.close() : null)
