@@ -2,6 +2,7 @@ const { auth, firestore: db } = require('../db');
 const jwt = require('jsonwebtoken');
 
 const login = async (req, res) => {
+    console.log('[AUTH-CONTROLLER] Request received for /login');
     try {
         const { email, password, token: idToken } = req.body;
 
