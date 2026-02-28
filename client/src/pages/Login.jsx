@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { ShieldCheck, Mail, Lock, Loader2, Award, Zap, AlertTriangle } from 'lucide-react';
 import axios from 'axios';
+import { auth } from '../lib/firebase';
+import { signInWithEmailAndPassword } from 'firebase/auth';
 
 const Login = ({ onLogin }) => {
     const [email, setEmail] = useState('');
@@ -14,12 +16,24 @@ const Login = ({ onLogin }) => {
         setError('');
 
         try {
-            const res = await axios.post('/api/auth/login', { email, password });
-            const { token, user } = res.data;
+            // 1. Sign in with Firebase on Client
+            const userCredential = await signInWithEmailAndPassword(auth, email, password);
+            const token = await userCredential.user.getIdToken();
+
+            // 2. Verify with Backend and get full profile
+            const res = await axios.post('/api/auth/login', {
+                email,
+                token // Send ID Token for backend verification
+            });
+
+            const { user } = res.data;
             onLogin({ ...user, token });
         } catch (err) {
             console.error('Login failed', err);
-            setError(err.response?.data?.error || 'Authentication failure. Check authorization or medical license.');
+            const errMsg = err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password'
+                ? 'Invalid credentials. Please contact administration.'
+                : (err.response?.data?.error || 'Authentication failure. Connection to medical gateway interrupted.');
+            setError(errMsg);
         } finally {
             setLoading(false);
         }

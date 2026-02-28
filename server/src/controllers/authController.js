@@ -1,73 +1,47 @@
-const bcrypt = require('bcryptjs');
+const { auth, firestore: db } = require('../db');
 const jwt = require('jsonwebtoken');
 
-// Production-ready mock data
-const users = [
-    {
-        id: 'admin-001',
-        name: 'Nivaro Admin',
-        email: 'admin@nivaro.com',
-        passwordHash: bcrypt.hashSync('admin123', 10),
-        role: 'admin'
-    },
-    {
-        id: 'doc-101',
-        name: 'Dr. Amartya Sen',
-        email: 'doctor@nivaro.com',
-        passwordHash: bcrypt.hashSync('admin123', 10),
-        role: 'doctor',
-        license_number: 'MC-2026-9921',
-        medical_degree: 'MD, General Medicine',
-        specialization: 'Internal Medicine',
-        experience_years: 12,
-        hospital_affiliation: 'City General Hospital',
-        profile_photo_url: 'https://ui-avatars.com/api/?name=Amartya+Sen&background=0D8ABC&color=fff',
-        rating: 4.8,
-        total_consultations: 1240,
-        responseTime: '~5 mins',
-        status: 'online'
-    },
-    {
-        id: 'op-201',
-        name: 'Village Operator John',
-        email: 'operator@nivaro.com',
-        passwordHash: bcrypt.hashSync('admin123', 10),
-        role: 'operator',
-        village_id: 'v1',
-        assigned_village_name: 'Village Alpha'
-    }
-];
-
 const login = async (req, res) => {
-    const { email, password } = req.body;
-    const user = users.find(u => u.email === email);
+    try {
+        const { email, password, token: idToken } = req.body;
+        console.log(`[AUTH] Firebase Login attempt for: ${email}`);
 
-    if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
-        return res.status(401).json({ error: 'Authentication failed. Invalid email or password.' });
+        let user;
+        let token = idToken;
+
+        if (idToken) {
+            // Verify Client-side Firebase ID Token
+            const decodedToken = await auth.verifyIdToken(idToken);
+            const userDoc = await db.collection('users').doc(decodedToken.uid).get();
+            user = { id: decodedToken.uid, ...userDoc.data() };
+        } else {
+            // Fallback: This usually happens on the client, but for API tests:
+            // In a real Firebase app, the client signs in and sends the ID Token.
+            return res.status(400).json({ error: 'Firebase ID Token required for backend verification' });
+        }
+
+        if (!user) {
+            return res.status(401).json({ error: 'User not found in Firestore' });
+        }
+
+        // We can still issue a custom JWT if needed for other services, 
+        // but typically Firebase ID token is enough.
+        res.json({ token, user });
+    } catch (err) {
+        console.error('[AUTH-ERROR] Firebase Login failed:', err);
+        res.status(500).json({ error: 'Authentication failed' });
     }
-
-    const token = jwt.sign(
-        {
-            id: user.id,
-            name: user.name,
-            role: user.role,
-            village_id: user.village_id || null
-        },
-        process.env.JWT_SECRET || 'nivaro_production_secret_2026',
-        { expiresIn: '12h' }
-    );
-
-    // Strip password hash before sending
-    const { passwordHash, ...safeUser } = user;
-    res.json({ token, user: safeUser });
 };
 
 const getDoctors = async (req, res) => {
-    // Return all users with 'doctor' role, stripping sensitive data
-    const doctors = users
-        .filter(u => u.role === 'doctor')
-        .map(({ passwordHash, ...doc }) => doc);
-    res.json(doctors);
+    try {
+        const snapshot = await db.collection('users').where('role', '==', 'doctor').get();
+        const doctors = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json(doctors);
+    } catch (err) {
+        console.error('[AUTH-ERROR] getDoctors failed:', err);
+        res.status(500).json({ error: 'Failed to fetch doctors' });
+    }
 };
 
-module.exports = { login, getDoctors, users };
+module.exports = { login, getDoctors };

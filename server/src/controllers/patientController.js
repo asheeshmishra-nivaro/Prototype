@@ -1,47 +1,62 @@
+const { firestore: db } = require('../db');
 const { v4: uuidv4 } = require('uuid');
-
-// Mock database for prototype (In production, use PostgreSQL)
-let patients = [];
 
 const registerPatient = async (req, res) => {
     try {
         const { name, age, gender, phone, address, medicalHistory } = req.body;
+        const patientId = uuidv4();
 
         const newPatient = {
-            id: uuidv4(),
+            id: patientId,
             name,
             age,
             gender,
             phone,
             address,
             medicalHistory,
-            visits: [],
-            createdAt: new Date()
+            createdAt: new Date(),
+            village_id: req.body.village_id || null
         };
 
-        patients.push(newPatient);
+        await db.collection('patients').doc(patientId).set(newPatient);
         res.status(201).json(newPatient);
     } catch (error) {
+        console.error('[PATIENT-ERROR] Registration failed:', error);
         res.status(500).json({ error: error.message });
     }
 };
 
 const searchPatientByPhone = async (req, res) => {
-    const { phone } = req.params;
-    const patient = patients.find(p => p.phone === phone);
+    try {
+        const { phone } = req.params;
+        const snapshot = await db.collection('patients').where('phone', '==', phone).limit(1).get();
 
-    if (!patient) {
-        return res.status(404).json({ error: 'Patient not found' });
+        if (snapshot.empty) {
+            return res.status(404).json({ error: 'Patient not found' });
+        }
+
+        const doc = snapshot.docs[0];
+        res.json({ id: doc.id, ...doc.data() });
+    } catch (error) {
+        console.error('[PATIENT-ERROR] Search failed:', error);
+        res.status(500).json({ error: error.message });
     }
-
-    res.json(patient);
 };
 
 const getPatientHistory = async (req, res) => {
-    const { id } = req.params;
-    const patient = patients.find(p => p.id === id);
-    if (!patient) return res.status(404).json({ error: 'Patient not found' });
-    res.json(patient.visits);
+    try {
+        const { id } = req.params;
+        const snapshot = await db.collection('consultations')
+            .where('patient_id', '==', id)
+            .orderBy('created_at', 'desc')
+            .get();
+
+        const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json(history);
+    } catch (error) {
+        console.error('[PATIENT-ERROR] History fetch failed:', error);
+        res.status(500).json({ error: error.message });
+    }
 }
 
 module.exports = {

@@ -1,9 +1,8 @@
+const { firestore: db } = require('../db');
 const { v4: uuidv4 } = require('uuid');
 const { logAction } = require('../services/auditService');
 const whatsappService = require('../services/whatsappService');
-const db = require('../db');
-
-// SQLite database is now used for all operations
+const pdfService = require('../services/pdfService');
 
 const startConsultation = async (req, res) => {
     try {
@@ -11,49 +10,41 @@ const startConsultation = async (req, res) => {
         const operator_id = req.user.id;
         const id = uuidv4();
 
-        await db.query(`
-            INSERT INTO consultations (id, patient_id, operator_id, doctor_id, vitals, status, fee, start_time)
-            VALUES ($1, $2, $3, $4, $5, 'in_progress', $6, CURRENT_TIMESTAMP)
-        `, [id, patient_id, operator_id, doctor_id, JSON.stringify(vitals), fee || 50]);
+        const consultation = {
+            id,
+            patient_id,
+            operator_id,
+            doctor_id,
+            village_id,
+            vitals,
+            status: 'pending', // Reverted to pending for queue visibility
+            fee: fee || 50,
+            created_at: new Date(),
+            start_time: new Date()
+        };
 
-        const consultation = { id, patient_id, operator_id, doctor_id, village_id, vitals, status: 'in_progress', fee };
+        await db.collection('consultations').doc(id).set(consultation);
 
-        // Notify Doctor via WhatsApp
+        // Notify Doctor via WhatsApp (Mocked)
         whatsappService.sendMessage('+91xxxxxxxxxx', `New Consultation Assigned: ${id}. Please join the channel.`);
 
         logAction(operator_id, req.user.role, 'START_CONSULTATION', 'consultations', id, null, consultation);
-
         res.status(201).json(consultation);
     } catch (err) {
-        console.error('[DB-ERROR] startConsultation:', err.message);
+        console.error('[FIREBASE-ERROR] startConsultation:', err);
         res.status(500).json({ error: 'Failed to start consultation' });
     }
 };
-
-const pdfService = require('../services/pdfService');
 
 const savePrescription = async (req, res) => {
     try {
         const { consultation_id, patient_id, medicines, instructions, doctor_info } = req.body;
         const doctor_id = req.user.id;
 
-        // Generating a unique, legally valid Prescription ID
         const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
         const rxShortId = Math.floor(1000 + Math.random() * 9000);
         const prescription_id = `NV-${dateStr}-${rxShortId}`;
         const id = uuidv4();
-
-        await db.query(`
-            INSERT INTO prescriptions (id, consultation_id, prescription_id, doctor_id, patient_id, medicines, instructions)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `, [id, consultation_id, prescription_id, doctor_id, patient_id, JSON.stringify(medicines), instructions]);
-
-        // Update consultation status
-        await db.query(`
-            UPDATE consultations 
-            SET status = 'rx_written', end_time = CURRENT_TIMESTAMP 
-            WHERE id = $1
-        `, [consultation_id]);
 
         const prescription = {
             id,
@@ -68,69 +59,61 @@ const savePrescription = async (req, res) => {
             timestamp: new Date()
         };
 
-        logAction(doctor_id, req.user.role, 'WRITE_PRESCRIPTION', 'prescriptions', id, null, prescription);
+        await db.collection('prescriptions').doc(id).set(prescription);
 
-        // FIFO Dispensing Engine
-        const patientDataResult = await db.query("SELECT village_id, name, phone FROM patients WHERE id = $1", [patient_id]);
-        const patient = patientDataResult.rows[0];
-        const village_id = patient.village_id;
+        // Update consultation status
+        await db.collection('consultations').doc(consultation_id).update({
+            status: 'rx_written',
+            end_time: new Date()
+        });
+
+        // Inventory FIFO Dispensing logic
+        const patientDoc = await db.collection('patients').doc(patient_id).get();
+        const village_id = patientDoc.exists ? patientDoc.data().village_id : 'Alpha';
 
         for (const med of medicines) {
-            // Calculate total units to dispense
-            const morning = med.morning?.enabled ? 1 : 0;
-            const afternoon = med.afternoon?.enabled ? 1 : 0;
-            const evening = med.evening?.enabled ? 1 : 0;
-            const night = med.night?.enabled ? 1 : 0;
-            const dailyDose = morning + afternoon + evening + night;
-            let unitsToDispense = dailyDose * (med.duration_days || 1);
+            let unitsToDispense = (med.duration_days || 1) * (
+                (med.morning?.enabled ? 1 : 0) +
+                (med.afternoon?.enabled ? 1 : 0) +
+                (med.evening?.enabled ? 1 : 0) +
+                (med.night?.enabled ? 1 : 0)
+            );
 
             if (unitsToDispense <= 0) continue;
 
-            // Fetch batches for this medicine at this village, sorted by expiry
-            const batches = await db.query(`
-                SELECT id, remaining_quantity, batch_number 
-                FROM inventory_batches 
-                WHERE medicine_id = (SELECT id FROM medicines WHERE sku_id = $1)
-                  AND village_id = $2
-                  AND remaining_quantity > 0
-                ORDER BY expiry_date ASC
-            `, [med.sku, village_id]);
+            const medsSnapshot = await db.collection('medicines').where('sku_id', '==', med.sku).limit(1).get();
+            if (medsSnapshot.empty) continue;
+            const medInternalId = medsSnapshot.docs[0].id;
 
-            for (const batch of batches.rows) {
+            const batchesSnapshot = await db.collection('inventory_batches')
+                .where('medicine_id', '==', medInternalId)
+                .where('village_id', '==', village_id)
+                .orderBy('expiry_date', 'asc')
+                .get();
+
+            for (const batchDoc of batchesSnapshot.docs) {
                 if (unitsToDispense <= 0) break;
+                const data = batchDoc.data();
+                const available = data.remaining_quantity || 0;
+                const toTake = Math.min(available, unitsToDispense);
 
-                const deductAmount = Math.min(batch.remaining_quantity, unitsToDispense);
-
-                // Update batch
-                await db.query(`
-                    UPDATE inventory_batches 
-                    SET remaining_quantity = remaining_quantity - $1 
-                    WHERE id = $2
-                `, [deductAmount, batch.id]);
-
-                // Log movement
-                await db.query(`
-                    INSERT INTO stock_movements (id, medicine_id, batch_id, village_id, movement_type, quantity, linked_entity_id, user_id, reason)
-                    VALUES ($1, (SELECT id FROM medicines WHERE sku_id = $2), $3, $4, 'DISPENSING', $5, $6, $7, $8)
-                `, [uuidv4(), med.sku, batch.id, village_id, -deductAmount, prescription_id, doctor_id, 'Prescription Finalized']);
-
-                unitsToDispense -= deductAmount;
-            }
-
-            if (unitsToDispense > 0) {
-                console.warn(`[STOCK-WARN] Under-dispensed ${med.name}: ${unitsToDispense} units missing in Village ${village_id}`);
+                if (toTake > 0) {
+                    await batchDoc.ref.update({ remaining_quantity: available - toTake });
+                    const moveId = uuidv4();
+                    await db.collection('stock_movements').doc(moveId).set({
+                        id: moveId, medicine_id: medInternalId, batch_id: batchDoc.id, village_id, movement_type: 'DISPENSING', quantity: -toTake, linked_entity_id: prescription_id, user_id: doctor_id, reason: 'Rx Finalized', timestamp: new Date()
+                    });
+                    unitsToDispense -= toTake;
+                }
             }
         }
 
-        // Generate PDF matching Preview
         const pdfUrl = await pdfService.generatePrescriptionPDF(prescription);
-
-        // Automated WhatsApp Delivery to Patient
-        whatsappService.sendPrescription(patient.phone || '+91xxxxxxxxxx', patient.name, prescription_id, pdfUrl);
+        logAction(doctor_id, req.user.role, 'WRITE_PRESCRIPTION', 'prescriptions', id, null, prescription);
 
         res.status(201).json(prescription);
     } catch (err) {
-        console.error('[DB-ERROR] savePrescription:', err.message);
+        console.error('[FIREBASE-ERROR] savePrescription:', err);
         res.status(500).json({ error: 'Failed to save prescription' });
     }
 };
@@ -138,38 +121,45 @@ const savePrescription = async (req, res) => {
 const getDoctorQueue = async (req, res) => {
     try {
         const doctor_id = req.user.id;
+        const snapshot = await db.collection('consultations')
+            .where('doctor_id', '==', doctor_id)
+            .where('status', '==', 'pending')
+            .get();
 
-        // Priority logic:
-        // 1. Critical SpO2 (< 90)
-        // 2. High BP (Sys >= 140 or Dia >= 90)
-        // 3. Normal Pending
-        // Sorted by priority then by wait time (created_at)
+        const queue = [];
+        for (const doc of snapshot.docs) {
+            const data = doc.data();
+            const patientDoc = await db.collection('patients').doc(data.patient_id).get();
+            const patientData = patientDoc.data() || {};
 
-        const result = await db.query(`
-            SELECT 
-                c.id, 
-                p.name as patient_name, 
-                p.age, 
-                p.gender,
-                p.village_id,
-                v.name as village_name,
-                c.vitals,
-                c.created_at,
-                CASE 
-                    WHEN CAST(json_extract(c.vitals, '$.spo2') AS numeric) < 90 THEN 1
-                    WHEN CAST(json_extract(c.vitals, '$.bp_systolic') AS numeric) >= 140 OR CAST(json_extract(c.vitals, '$.bp_diastolic') AS numeric) >= 90 THEN 2
-                    ELSE 3
-                END as priority_level
-            FROM consultations c
-            JOIN patients p ON c.patient_id = p.id
-            JOIN villages v ON p.village_id = v.id
-            WHERE c.doctor_id = $1 AND c.status = 'pending'
-            ORDER BY priority_level ASC, c.created_at ASC
-        `, [doctor_id]);
+            // Calculate Priority Level
+            const vitals = data.vitals || {};
+            let priorityLevel = 3;
+            if (Number(vitals.spo2) < 90) priorityLevel = 1;
+            else if (Number(vitals.bp_systolic) >= 140 || Number(vitals.bp_diastolic) >= 90) priorityLevel = 2;
 
-        res.json(result.rows);
+            queue.push({
+                id: doc.id,
+                patient_name: patientData.name || 'Unknown',
+                age: patientData.age,
+                gender: patientData.gender,
+                village_id: patientData.village_id,
+                village_name: patientData.village_name || 'Village',
+                vitals,
+                created_at: data.created_at,
+                priority_level: priorityLevel
+            });
+        }
+
+        // Sort by priority and time
+        queue.sort((a, b) => {
+            if (a.priority_level !== b.priority_level) return a.priority_level - b.priority_level;
+            return a.created_at - b.created_at;
+        });
+
+        res.json(queue);
     } catch (err) {
-        console.error('[DB-ERROR] getDoctorQueue:', err);
+        console.error('[FIREBASE-ERROR] getDoctorQueue:', err);
         res.status(500).json({ error: 'Queue retrieval failed' });
     }
 };
